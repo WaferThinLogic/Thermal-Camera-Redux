@@ -15,11 +15,17 @@
 #include <opencv2/highgui.hpp>
 #include <opencv2/core/mat.hpp>  // Video Frame class
 #include <iostream>
+#include <vector>
+#include <cctype>
+#include <cstdlib>
+#include <cstring>
 
 using namespace std;
 using namespace cv;
 
 #include "thread.h" // threads and FIFO ring buffer
+#include "p1_camera.h"
+#include "mnn_sr.hpp"
 
 #define VERSION_STR "0.9.3"
 /*****************************************************************************************
@@ -285,8 +291,17 @@ void dumpV4L2() {
 #define WINDOW_NAME "Thermal Camera Redux"
 
 // Camera's native resolution
+#ifndef P1_CAMERA
+#define P1_CAMERA 0
+#endif
+
+#if P1_CAMERA
+#define FIXED_TC_WIDTH  	160
+#define FIXED_TC_HEIGHT 	120
+#else
 #define FIXED_TC_WIDTH  	256
 #define FIXED_TC_HEIGHT 	192
+#endif
 
 #ifndef HUD_ALPHA
 #define HUD_ALPHA 0.4 // 40% HUD, 60% background
@@ -842,6 +857,150 @@ typedef struct {
 
 bool Use_Celsius;   // GLOBAL KLUGE UNTIL REWORKED
 int Use_Histogram; // GLOBAL KLUGE UNTIL REWORKED
+static int Use_P1 = 0;
+#if P1_CAMERA
+static unsigned long p1_debug_interval_ms = 0;
+static const char *p1_dump_path = NULL;
+static int p1_dump_count = 1;
+static const char *p1_raw_dump_path = NULL;
+static size_t p1_raw_dump_bytes = 5 * 1024 * 1024;
+static const char *p1_size_log_path = NULL;
+static size_t p1_size_log_packets = 20000;
+static int p1_range_mode = 1;
+static unsigned long p1_range_interval_ms = 2000;
+static P1Camera *g_p1_cam = NULL;
+#endif
+
+#if P1_CAMERA
+typedef struct {
+	P1Camera *cam;
+	pthread_t thread;
+	pthread_mutex_t mutex;
+	int running;
+	int has_frame;
+	int error;
+	unsigned long frame_id;
+	std::vector<unsigned char> frame;
+	int debug;
+	unsigned long debug_interval_ms;
+	unsigned long last_debug_ms;
+	unsigned long start_ms;
+	unsigned long frames_ok;
+	unsigned long timeouts;
+	unsigned long errors;
+	unsigned long bytes_read;
+	unsigned long last_debug_bytes;
+	unsigned long last_debug_transfers;
+	unsigned long last_frame_ms;
+	double avg_frame_interval_ms;
+	unsigned long last_frame_interval_ms;
+	unsigned long last_frame_transfers;
+	FILE *dump_fp;
+	int dump_limit;
+	int dump_written;
+	FILE *raw_dump_fp;
+	FILE *size_log_fp;
+} P1Shared;
+
+static void *p1_reader_thread(void *arg) {
+	P1Shared *ps = (P1Shared *)arg;
+	std::vector<unsigned char> local;
+	local.resize(ps->frame.size());
+
+	while (ps->running) {
+		size_t bytes = 0;
+		int ok = p1_read_frame(ps->cam, local.data(), local.size(), 500, &bytes);
+		if (ok < 0) {
+			pthread_mutex_lock(&ps->mutex);
+			ps->error = 1;
+			ps->errors++;
+			ps->running = 0;
+			pthread_mutex_unlock(&ps->mutex);
+			break;
+		}
+		if (ok == 0) {
+			pthread_mutex_lock(&ps->mutex);
+			ps->timeouts++;
+			ps->bytes_read += bytes;
+			pthread_mutex_unlock(&ps->mutex);
+			goto maybe_log;
+		}
+		pthread_mutex_lock(&ps->mutex);
+		memcpy(ps->frame.data(), local.data(), local.size());
+		ps->has_frame = 1;
+		ps->frame_id++;
+		ps->frames_ok++;
+		ps->bytes_read += bytes;
+		{
+			unsigned long now_ms = currentTimeMillis();
+			if (ps->last_frame_ms != 0) {
+				ps->last_frame_interval_ms = now_ms - ps->last_frame_ms;
+				if (ps->avg_frame_interval_ms <= 0.0) {
+					ps->avg_frame_interval_ms = (double)ps->last_frame_interval_ms;
+				} else {
+					ps->avg_frame_interval_ms = (ps->avg_frame_interval_ms * 0.9) + ((double)ps->last_frame_interval_ms * 0.1);
+				}
+			}
+			ps->last_frame_ms = now_ms;
+			P1TransferStats stats;
+			p1_get_transfer_stats(ps->cam, &stats);
+			ps->last_frame_transfers = stats.last_frame_transfers;
+		}
+		if (ps->dump_fp && ps->dump_written < ps->dump_limit) {
+			fwrite(ps->frame.data(), 1, ps->frame.size(), ps->dump_fp);
+			fflush(ps->dump_fp);
+			ps->dump_written++;
+		}
+		pthread_mutex_unlock(&ps->mutex);
+		goto maybe_log;
+
+maybe_log:
+		if (ps->debug) {
+			unsigned long now_ms = currentTimeMillis();
+			if ((now_ms - ps->last_debug_ms) >= ps->debug_interval_ms) {
+				double secs = (double)(now_ms - ps->start_ms) / 1000.0;
+				P1TransferStats stats;
+				p1_get_transfer_stats(ps->cam, &stats);
+				unsigned long max_size = 0;
+				unsigned long max_count = 0;
+				for (unsigned long i = 0; i <= 512; i++) {
+					if (stats.counts[i] > max_count) {
+						max_count = stats.counts[i];
+						max_size = i;
+					}
+				}
+				double fps = (secs > 0.0) ? (ps->frames_ok / secs) : 0.0;
+				double avg_bytes = (ps->frames_ok > 0) ? ((double)ps->bytes_read / (double)ps->frames_ok) : 0.0;
+				char short_hex[64];
+				short_hex[0] = '\0';
+				unsigned long hex_len = (stats.last_short_len > 8) ? 8 : stats.last_short_len;
+				for (unsigned long i = 0; i < hex_len; i++) {
+					char tmp[4];
+					snprintf(tmp, sizeof(tmp), "%02x", stats.last_short_bytes[i]);
+					strcat(short_hex, tmp);
+				}
+				unsigned long delta_bytes = ps->bytes_read - ps->last_debug_bytes;
+				unsigned long delta_transfers = stats.total - ps->last_debug_transfers;
+				double bytes_per_sec = (secs > 0.0) ? (delta_bytes / (double)(ps->debug_interval_ms / 1000.0)) : 0.0;
+				double transfers_per_sec = (secs > 0.0) ? (delta_transfers / (double)(ps->debug_interval_ms / 1000.0)) : 0.0;
+				printf("P1 debug: frames=%lu fps=%.2f timeouts=%lu errors=%lu bytes=%lu avg_frame_bytes=%.1f rxBps=%.0f xfers/s=%.1f full=%lu partial=%lu last_xfer=%lu frame_ms=%lu avg_frame_ms=%.1f frame_xfers=%lu short_pkts=%lu top_pkt=%lu(%lu) good=%lu bad=%lu last_frame=%lu short=%lu drop_small=%lu buf=%lu buf_max=%lu drops=%lu short_hex=%s\n",
+					ps->frames_ok, fps, ps->timeouts, ps->errors, ps->bytes_read, avg_bytes,
+					bytes_per_sec, transfers_per_sec,
+					stats.full_packets, stats.partial_packets, stats.last_transfer_size,
+					ps->last_frame_interval_ms, ps->avg_frame_interval_ms, ps->last_frame_transfers,
+					stats.short_packets, max_size, max_count, stats.good_frames, stats.bad_frames,
+					stats.last_frame_bytes, stats.last_short_size, stats.drop_small,
+					stats.buffer_bytes, stats.buffer_max, stats.drop_events, short_hex);
+				ps->last_debug_bytes = ps->bytes_read;
+				ps->last_debug_transfers = stats.total;
+				ps->last_debug_ms = now_ms;
+			}
+		}
+		continue;
+	}
+	return NULL;
+}
+#endif
 
 // Inline optimization
 #define CorF(cel) (float)(Use_Celsius ? cel : ( (((float)cel * 9.0)/5.0) + 32.0 ))
@@ -977,6 +1136,7 @@ typedef struct {
 	bool recording;
 	bool recordingActive = false;
 	bool fullscreen;
+	bool upscaleMode;
 } Controls;
 
 
@@ -1680,6 +1840,7 @@ void resetDefaults() {
 	controls.rad          = 0; // Blur radius (0=no blur)
 	controls.threshold.celsius = 2;
 	controls.cmapCurrent  = DEFAULT_COLORMAP_INDEX;
+	controls.upscaleMode       = false;
 	strcpy(controls.snaptime, "None");
 }
 
@@ -1741,6 +1902,9 @@ void setScaleControls() {
 #else
 	ColorScaleWidth = 3 + MyScale;  // 4 to N
 #endif
+	if ( ColorScaleWidth % 2 ) {
+		ColorScaleWidth += 1; // YUYV colormap scale requires even width
+	}
 
 	// Help needs to be redrawn based on font change
 	controls.lastHelpScale = -1; // trigger Help to be redrawn
@@ -3094,6 +3258,9 @@ void rotateDisplay( ProcessedThermalFrame *ptf, int rotate ) {
 void printUsage() {
   printf("\n");
   printf( "Camera Usage: \n\t%s -d n (where 'n' is the number of the desired video camera)\n\n", Argv0 );
+#if P1_CAMERA
+  printf( "P1 Usage: \n\t%s -p1 (use Thermal Master P1 USB)\n\n", Argv0 );
+#endif
   printf( "Offline Usage: \n\t%s -f input.raw (where input.raw is a raw dump file from %s)\n\n", Argv0, Argv0 );
   printf( "Optional flags:  [-rotate n] [-scale n] [-fullscreen ] [-cmap n] [-fps n] [-font n] [-clip n] [-thick n]\n");
 #if 0
@@ -3108,6 +3275,7 @@ void printKeyBindings() {
   printf("\n");
   printf("a z: [In|De]crease Blur\n");
   printf("s x: +/- threshold from avg temp that contols min/max displays and ruler plot colors\n");
+  printf("n  : Toggle Upscaling Model (High Quality Upscale + Smooth)\n");
   printf("d c: Change interpolated window scale [camera native to fullscreen]\n");
   printf("f v: [In|De]crease Contrast\n");
   printf("g b: Cycle [for|back]wards through interpolation methods\n");
@@ -3119,6 +3287,9 @@ void printKeyBindings() {
   printf("1  : Font\n");
   printf("5  : Reset defaults\n");
   printf("p  : Sna[p]shot (both .png and offline .raw)\n");
+#if P1_CAMERA
+  printf("2  : (P1) Toggle radiometric range low/high\n");
+#endif
   printf("h  : Cycle through overlayed screen data\n");
   printf("t  : Toggle between Celsius and Fahrenheit\n");
   printf("y  : Toggle Historgram filter (for gray scales)\n");
@@ -3148,6 +3319,12 @@ void printInfo() {
   printf("\t\thttps://github.com/92es/Thermal-Camera-Redux     - Ported/Updated C/C++ app\n");
   printf("\n");
   printf("A multi-threaded C/C++ app to read, parse, display thermal data from the Topdon TC001 Thermal camera (and clones)\n");
+#if P1_CAMERA
+  	printf("P1 support is enabled for Thermal Master P1 (VID 0x3474, PID 0x45c2).\n");
+  #ifdef USE_MNN
+  	printf("MNN support is enabled for Upscaling Model.\n");
+  #endif
+#endif
   printf("Rewritten with additional functionality, bug fixes, optimizations and offline post processing\n");
   printf("Built with display %dx%d, max:default scale %d:%d, rotation %s, default %s, %d colormaps, %s,\n", 
 	  DISPLAY_WIDTH, DISPLAY_HEIGHT, MAX_SCALE_STEPS, TC_DEF_SCALE, ROTATION_STR,
@@ -3222,6 +3399,21 @@ void processKeypress(int c, ProcessedThermalFrame *ptf, Mat *frame ) {
 
 		case 's': reThreshold( 1); break; // Threshold
 		case 'x': reThreshold(-1); break;
+
+		case 'n':
+			controls.upscaleMode = !controls.upscaleMode;
+			threadData.configurationChanged++;
+#ifdef USE_MNN
+			if (!quietStdout) {
+                // Check if model init was actually successful (we can't easily check internal state of image_1.cpp here, 
+                // but we can assume if it compiled with USE_MNN it's trying).
+                // Better yet, just print the text.
+                printf("Upscaling Model: %s\n", controls.upscaleMode ? "ON" : "OFF");
+            }
+#else
+			if (!quietStdout) printf("Upscaling Model (Simulation): %s\n", controls.upscaleMode ? "ON" : "OFF");
+#endif
+			break;
 
 		case 'd': 
 			  threadData.configurationChanged++;
@@ -3327,6 +3519,19 @@ FILTER_TYPE_CHANGE:
 #endif
 
 			  break;  // Snapshot
+
+		case '2':
+#if P1_CAMERA
+			  if ( Use_P1 && g_p1_cam ) {
+				threadData.configurationChanged++;
+				p1_range_mode = (p1_range_mode + 1) % 2;
+				p1_set_range_mode(g_p1_cam, p1_range_mode, p1_range_interval_ms);
+				if ( ! quietStdout ) {
+					printf("P1 range: %s\n", p1_range_mode ? "high" : "low");
+				}
+			  }
+#endif
+			  break;
 
 		case 'o': // Cycle [1 - (MAX_MOD-1)], not [0 - (MAX_MOD-1)]
 			  threadData.configurationChanged++;
@@ -5035,6 +5240,92 @@ printf("\n%s-record [prefix] is coming soon ...\n%s", BLUE_STR(), RESET_STR() );
 			}
 			rotateDisplay( ptf, 0 );
 			i++;
+		} else if ( ! strcmp( argv[i], "-p1") ) {
+#if P1_CAMERA
+			Use_P1 = 1;
+			threadData.source    = "P1";
+			threadData.inputFile = 0;
+			inputNotFound = 0;
+#else
+			printf("%sP1 support not enabled. Rebuild with -DP1_CAMERA=1 and libusb.\n%s", RED_STR(), RESET_STR() );
+			return -1;
+#endif
+		} else if ( ! strcmp( argv[i], "-p1-debug") ) {
+#if P1_CAMERA
+			Use_P1 = 1;
+			threadData.source    = "P1";
+			threadData.inputFile = 0;
+			inputNotFound = 0;
+			if ( hasNext && isdigit((unsigned char)argv[next][0]) ) {
+				p1_debug_interval_ms = (unsigned long)abs( atoi( argv[ i + 1 ] ) );
+				i++;
+			} else {
+				p1_debug_interval_ms = 1000;
+			}
+#else
+			printf("%sP1 support not enabled. Rebuild with -DP1_CAMERA=1 and libusb.\n%s", RED_STR(), RESET_STR() );
+			return -1;
+#endif
+		} else if ( ! strcmp( argv[i], "-p1-dump") && hasNext ) {
+#if P1_CAMERA
+			Use_P1 = 1;
+			threadData.source    = "P1";
+			threadData.inputFile = 0;
+			inputNotFound = 0;
+			p1_dump_path = argv[i + 1];
+			i++;
+#else
+			printf("%sP1 support not enabled. Rebuild with -DP1_CAMERA=1 and libusb.\n%s", RED_STR(), RESET_STR() );
+			return -1;
+#endif
+		} else if ( ! strcmp( argv[i], "-p1-raw-dump") && hasNext ) {
+#if P1_CAMERA
+			Use_P1 = 1;
+			threadData.source    = "P1";
+			threadData.inputFile = 0;
+			inputNotFound = 0;
+			p1_raw_dump_path = argv[i + 1];
+			i++;
+#else
+			printf("%sP1 support not enabled. Rebuild with -DP1_CAMERA=1 and libusb.\n%s", RED_STR(), RESET_STR() );
+			return -1;
+#endif
+		} else if ( ! strcmp( argv[i], "-p1-raw-bytes") && hasNext ) {
+#if P1_CAMERA
+			p1_raw_dump_bytes = (size_t)atoll( argv[ i + 1 ] );
+			i++;
+#else
+			printf("%sP1 support not enabled. Rebuild with -DP1_CAMERA=1 and libusb.\n%s", RED_STR(), RESET_STR() );
+			return -1;
+#endif
+		} else if ( ! strcmp( argv[i], "-p1-size-log") && hasNext ) {
+#if P1_CAMERA
+			Use_P1 = 1;
+			threadData.source    = "P1";
+			threadData.inputFile = 0;
+			inputNotFound = 0;
+			p1_size_log_path = argv[i + 1];
+			i++;
+#else
+			printf("%sP1 support not enabled. Rebuild with -DP1_CAMERA=1 and libusb.\n%s", RED_STR(), RESET_STR() );
+			return -1;
+#endif
+		} else if ( ! strcmp( argv[i], "-p1-size-count") && hasNext ) {
+#if P1_CAMERA
+			p1_size_log_packets = (size_t)atoll( argv[ i + 1 ] );
+			i++;
+#else
+			printf("%sP1 support not enabled. Rebuild with -DP1_CAMERA=1 and libusb.\n%s", RED_STR(), RESET_STR() );
+			return -1;
+#endif
+		} else if ( ! strcmp( argv[i], "-p1-dump-count") && hasNext ) {
+#if P1_CAMERA
+			p1_dump_count = abs( atoi( argv[ i + 1 ] ) );
+			i++;
+#else
+			printf("%sP1 support not enabled. Rebuild with -DP1_CAMERA=1 and libusb.\n%s", RED_STR(), RESET_STR() );
+			return -1;
+#endif
 		} else if (( ! strcmp( argv[i], "-f"    ) ||
 			     ! strcmp( argv[i], "-file" ) ) && hasNext ) {
 			threadData.source     = "File";
@@ -5047,6 +5338,10 @@ printf("\n%s-record [prefix] is coming soon ...\n%s", BLUE_STR(), RESET_STR() );
 			i++;
 		} else if (( ! strcmp( argv[i], "-d"      ) ||
 			     ! strcmp( argv[i], "-device" ) ) && hasNext ) {
+			if ( Use_P1 ) {
+				printf("%sCannot use -device with -p1. Use -p1 alone.\n%s", RED_STR(), RESET_STR() );
+				return -1;
+			}
 			threadData.source    = "Camera";
 			sprintf( camera, "/dev/video%d", abs( atoi(argv[i + 1]) ) ); // Default is camera 0
 			threadData.inputFile = 0;
@@ -5063,6 +5358,14 @@ printf("\n%s-record [prefix] is coming soon ...\n%s", BLUE_STR(), RESET_STR() );
 			return -1;
 		}
 	}
+#if P1_CAMERA
+	if ( inputNotFound && p1_device_present() ) {
+		Use_P1 = 1;
+		threadData.source    = "P1";
+		threadData.inputFile = 0;
+		inputNotFound = 0;
+	}
+#endif
 	return inputNotFound;
 }
 
@@ -5168,6 +5471,13 @@ int mainPrivate (int argc, char *argv[]) {
 	//VideoCapture cap(camera, CAP_V4L); // CAP_V4L dictates frame buffer size and format 
 	VideoCapture cap; // CAP_V4L dictates frame buffer size and format 
 
+#if P1_CAMERA
+	P1Camera *p1 = NULL;
+	vector<unsigned char> p1_frame;
+	P1Shared p1_shared;
+	unsigned long p1_last_frame_id = 0;
+#endif
+
 	int64_t startup2 = currentTimeMicros();
 
 	// Create a VideoCapture object and use camera to capture the video
@@ -5177,6 +5487,58 @@ int mainPrivate (int argc, char *argv[]) {
 		printUsage();
 		return -1;
 	}
+
+#if P1_CAMERA
+	if ( Use_P1 ) {
+		p1 = p1_open( quietStdout );
+		if ( ! p1 ) {
+			printf("%sUnable to open P1 device. Verify permissions and cable.\n%s", RED_STR(), RESET_STR() );
+			return -1;
+		}
+		g_p1_cam = p1;
+		p1_set_range_mode(p1, p1_range_mode, p1_range_interval_ms);
+		p1_frame.resize( P1_FRAME_SIZE );
+		p1_shared = P1Shared();
+		p1_shared.cam = p1;
+		p1_shared.running = 1;
+		p1_shared.frame.resize(P1_FRAME_SIZE);
+		p1_shared.debug = (p1_debug_interval_ms > 0);
+		p1_shared.debug_interval_ms = (p1_debug_interval_ms > 0) ? p1_debug_interval_ms : 1000;
+		p1_shared.start_ms = currentTimeMillis();
+		p1_shared.last_debug_ms = p1_shared.start_ms;
+		p1_shared.last_debug_bytes = 0;
+		p1_shared.last_debug_transfers = 0;
+		p1_shared.last_frame_ms = 0;
+		p1_shared.avg_frame_interval_ms = 0.0;
+		p1_shared.last_frame_interval_ms = 0;
+		p1_shared.last_frame_transfers = 0;
+		if ( p1_dump_path ) {
+			p1_shared.dump_fp = fopen(p1_dump_path, "wb");
+			if ( ! p1_shared.dump_fp ) {
+				printf("%sUnable to open P1 dump file %s\n%s", RED_STR(), p1_dump_path, RESET_STR());
+			}
+			p1_shared.dump_limit = (p1_dump_count > 0) ? p1_dump_count : 1;
+		}
+		if ( p1_raw_dump_path ) {
+			p1_shared.raw_dump_fp = fopen(p1_raw_dump_path, "wb");
+			if ( ! p1_shared.raw_dump_fp ) {
+				printf("%sUnable to open P1 raw dump file %s\n%s", RED_STR(), p1_raw_dump_path, RESET_STR());
+			} else {
+				p1_set_raw_dump(p1, p1_shared.raw_dump_fp, p1_raw_dump_bytes);
+			}
+		}
+		if ( p1_size_log_path ) {
+			p1_shared.size_log_fp = fopen(p1_size_log_path, "w");
+			if ( ! p1_shared.size_log_fp ) {
+				printf("%sUnable to open P1 size log file %s\n%s", RED_STR(), p1_size_log_path, RESET_STR());
+			} else {
+				p1_set_size_log(p1, p1_shared.size_log_fp, p1_size_log_packets);
+			}
+		}
+		pthread_mutex_init(&p1_shared.mutex, NULL);
+		pthread_create(&p1_shared.thread, NULL, p1_reader_thread, &p1_shared);
+	}
+#endif
 
 	int64_t startup3 = currentTimeMicros();
 
@@ -5322,64 +5684,144 @@ int mainPrivate (int argc, char *argv[]) {
 
 		TS( int64_t readMicros = loopMicros; )
 
+		int p1_read_ok = 1;
+		static int p1_have_frame = 0;
+		static int p1_new_frame = 0;
 		if ( ! threadData.FreezeFrame ) {
 			if        ( ! threadData.inputFile ) {
 				// Try to read from camera
 				// Jump into FreezeFrame mode on camera read issues
 				// When coming back out of FreezeFrame, try to re-establish camera connection
 
-				if ( threadData.lostVideo ) {
-					released = 0;
-					if ( openCamera( cap, camera, 0 ) < 0 ) {
-						printf(RED_STR());
-						printf("\nOpen camera(%s) failed, switching to freeze frame.\n", camera);
-						printf("Fix camera connection and then press 'e' to exit freeze frame.\n\n");
-						printf(RESET_STR());
-						threadData.lostVideo   = 1;
-						threadData.FreezeFrame = 1;
-					} else {
-						// TODO - FIXME - Regress long disconnects and mouse actions
-						// onMouseCallback was lost during long dissconnect
-						//setMouseCallback( WINDOW_NAME, onMouseCallback, &threadData );
-						threadData.lostVideo = 0;
-					}
-				}
-
-				// Wait for user to fix camera connection and exit FreeseFrame
-				if ( ! threadData.lostVideo && ! threadData.FreezeFrame ) {
-					// Capture frame-by-frame from video camera
-					// Don't overwrite last good frame
-					// Avoid expensive deep copy clone() by double buffering
-				
-					int readError;
-					if (0 == lastGoodFrame) {
-						cap >> tFrame_1;
-						readError     = tFrame_1.empty();
-						lastGoodFrame = readError ?        0 :        1;
-						rawFrame      = readError ? tFrame_0 : tFrame_1;
-					} else {
-						cap >> tFrame_0;
-						readError     = tFrame_0.empty();
-						lastGoodFrame = readError ?        1 :        0;
-						rawFrame      = readError ? tFrame_1 : tFrame_0;
-					}
-
-					if ( readError ) {
-						printf(RED_STR());
-						printf("\nERROR: Frame is empty, switching to freeze frame.\n");
-						printf("Fix camera connection and then press 'e' to exit freeze frame.\n\n");
-						printf(RESET_STR());
-						if ( ! released ) {
-							cap.release();
-							released = 1;
+#if P1_CAMERA
+				if ( Use_P1 ) {
+					if ( threadData.lostVideo ) {
+						if ( p1 ) {
+							p1_free( p1 );
+							p1 = NULL;
 						}
-						threadData.lostVideo   = 1;
-						threadData.FreezeFrame = 1;
+						p1 = p1_open( quietStdout );
+						if ( ! p1 ) {
+							printf(RED_STR());
+							printf("\nOpen P1 failed, switching to freeze frame.\n");
+							printf("Fix camera connection and then press 'e' to exit freeze frame.\n\n");
+							printf(RESET_STR());
+							threadData.lostVideo   = 1;
+							threadData.FreezeFrame = 1;
+						} else {
+							threadData.lostVideo = 0;
+						}
 					}
-				}
 
-				// Display source error in HUD display if camera connection was lost
-				threadData.source = threadData.lostVideo ? "ERROR" : "Camera";
+					if ( ! threadData.lostVideo && ! threadData.FreezeFrame ) {
+						int local_ok = 0;
+						pthread_mutex_lock(&p1_shared.mutex);
+						if (p1_shared.error) {
+							local_ok = -1;
+						} else if (p1_shared.has_frame && p1_shared.frame_id != p1_last_frame_id) {
+							memcpy(p1_frame.data(), p1_shared.frame.data(), p1_shared.frame.size());
+							p1_last_frame_id = p1_shared.frame_id;
+							local_ok = 1;
+						}
+						pthread_mutex_unlock(&p1_shared.mutex);
+
+						if ( local_ok < 0 ) {
+							printf(RED_STR());
+							printf("\nERROR: P1 frame read failed, switching to freeze frame.\n");
+							printf("Fix camera connection and then press 'e' to exit freeze frame.\n\n");
+							printf(RESET_STR());
+							threadData.lostVideo   = 1;
+							threadData.FreezeFrame = 1;
+							p1_read_ok = 0;
+						} else if ( local_ok == 0 ) {
+							p1_read_ok = 0;
+						} else {
+							size_t ir_len = P1_WIDTH * P1_HEIGHT * 2;
+							size_t temp_len = P1_WIDTH * P1_HEIGHT * 2;
+							size_t payload_len = P1_FRAME_SIZE - P1_FRAME_SKIP;
+							if ( payload_len < (ir_len + temp_len) ) {
+								p1_read_ok = 0;
+							} else {
+							size_t info_len = payload_len - ir_len - temp_len;
+							size_t needed = P1_FRAME_SKIP + ir_len + info_len + temp_len;
+							if ( P1_FRAME_SIZE >= needed ) {
+								unsigned char *payload = p1_frame.data() + P1_FRAME_SKIP;
+								unsigned char *dest = NULL;
+								if (0 == lastGoodFrame) {
+									dest = tFrame_1.data;
+									lastGoodFrame = 1;
+									rawFrame = tFrame_1;
+								} else {
+									dest = tFrame_0.data;
+									lastGoodFrame = 0;
+									rawFrame = tFrame_0;
+								}
+								memcpy( dest, payload, ir_len );
+								memcpy( dest + ir_len, payload + ir_len + info_len, temp_len );
+								p1_have_frame = 1;
+								p1_new_frame = 1;
+							}
+						}
+					}
+					}
+
+					threadData.source = threadData.lostVideo ? "ERROR" : "P1";
+				} else
+#endif
+				{
+					if ( threadData.lostVideo ) {
+						released = 0;
+						if ( openCamera( cap, camera, 0 ) < 0 ) {
+							printf(RED_STR());
+							printf("\nOpen camera(%s) failed, switching to freeze frame.\n", camera);
+							printf("Fix camera connection and then press 'e' to exit freeze frame.\n\n");
+							printf(RESET_STR());
+							threadData.lostVideo   = 1;
+							threadData.FreezeFrame = 1;
+						} else {
+							// TODO - FIXME - Regress long disconnects and mouse actions
+							// onMouseCallback was lost during long dissconnect
+							//setMouseCallback( WINDOW_NAME, onMouseCallback, &threadData );
+							threadData.lostVideo = 0;
+						}
+					}
+
+					// Wait for user to fix camera connection and exit FreeseFrame
+					if ( ! threadData.lostVideo && ! threadData.FreezeFrame ) {
+						// Capture frame-by-frame from video camera
+						// Don't overwrite last good frame
+						// Avoid expensive deep copy clone() by double buffering
+					
+						int readError;
+						if (0 == lastGoodFrame) {
+							cap >> tFrame_1;
+							readError     = tFrame_1.empty();
+							lastGoodFrame = readError ?        0 :        1;
+							rawFrame      = readError ? tFrame_0 : tFrame_1;
+						} else {
+							cap >> tFrame_0;
+							readError     = tFrame_0.empty();
+							lastGoodFrame = readError ?        1 :        0;
+							rawFrame      = readError ? tFrame_1 : tFrame_0;
+						}
+
+						if ( readError ) {
+							printf(RED_STR());
+							printf("\nERROR: Frame is empty, switching to freeze frame.\n");
+							printf("Fix camera connection and then press 'e' to exit freeze frame.\n\n");
+							printf(RESET_STR());
+							if ( ! released ) {
+								cap.release();
+								released = 1;
+							}
+							threadData.lostVideo   = 1;
+							threadData.FreezeFrame = 1;
+						}
+					}
+
+					// Display source error in HUD display if camera connection was lost
+					threadData.source = threadData.lostVideo ? "ERROR" : "Camera";
+				}
 
 			} else if ( 1 != numberOfRawFrames ) {
 				// Do not repetitiously re-read a single raw frame snapshot
@@ -5395,6 +5837,12 @@ int mainPrivate (int argc, char *argv[]) {
 				break;
 			}
 		}
+
+#if P1_CAMERA
+		if ( Use_P1 && !p1_read_ok && !p1_have_frame ) {
+			continue;
+		}
+#endif
 
 		TS( int64_t mainMicros = currentTimeMicros(); )
 
@@ -5493,7 +5941,9 @@ int mainPrivate (int argc, char *argv[]) {
 			TS( int64_t renderMicros = currentTimeMicros(); )
 
 			// Calc FPS
-			controls.frameCounter++;
+			if (!Use_P1 || p1_new_frame) {
+				controls.frameCounter++;
+			}
 
 			int64_t now    = currentTimeMillis();
 			double seconds = (double)(now - controls.startMills) / (double)1000.0;
@@ -5502,6 +5952,7 @@ int mainPrivate (int argc, char *argv[]) {
 				// Periodically reset counters
 				resetFrameCounter();
 			}
+			p1_new_frame = 0;
 
 
 #if DRAW_SINGLE_THREAD
@@ -5843,6 +6294,28 @@ SHUTDOWN:
 		// When everything done, release the video capture and write object
 		cap.release();
 	}
+
+#if P1_CAMERA
+	if ( Use_P1 && p1 ) {
+		p1_shared.running = 0;
+		pthread_join(p1_shared.thread, NULL);
+		pthread_mutex_destroy(&p1_shared.mutex);
+		if ( p1_shared.dump_fp ) {
+			fclose(p1_shared.dump_fp);
+			p1_shared.dump_fp = NULL;
+		}
+		if ( p1_shared.raw_dump_fp ) {
+			fclose(p1_shared.raw_dump_fp);
+			p1_shared.raw_dump_fp = NULL;
+		}
+		if ( p1_shared.size_log_fp ) {
+			fclose(p1_shared.size_log_fp);
+			p1_shared.size_log_fp = NULL;
+		}
+		p1_free( p1 );
+		p1 = NULL;
+	}
+#endif
 
 	if ( rawReadFp ) {
 		fclose( rawReadFp );
