@@ -1,8 +1,6 @@
 # Thermal-Camera-Redux
 
-# NOTE: SUPPORT FOR THIS ACCOUNT WILL GO DORMANT ONCE GITHUB FORCE BLOCKS IT FOR 2FA.  SUBSEQUENT UPDATES MAYBE HOMED ELSEWHERE.  UPDATES WILL BE NOTED ON THE EEVBLOG FORUM.
-
- Topdon TC001 (and clones: Topdon TS001, InfiRay P2 Pro, MaAnt Super IR Cam, etc.) Linux thermal camera app to read and display live and offline thermal data.<br />
+ Topdon TC001 (and clones: Topdon TS001, InfiRay P2 Pro, MaAnt Super IR Cam, etc.) and Thermal Master P1 Linux thermal camera app to read and display live and offline thermal data.<br />
 
 Ported and updated to Linux C/C++ app based on Les Wright's 21 June 2023 PyThermalCamera Python app.<br />
   - All prior licenses apply.<br />
